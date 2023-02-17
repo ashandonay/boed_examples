@@ -8,7 +8,6 @@ import pyro.poutine as poutine
 from pyro.contrib.util import lexpand
 from pyro.infer.autoguide.utils import mean_field_entropy
 import math
-from noble_experiment_design.train_utils import vnmc_loss
 
 
 
@@ -52,7 +51,7 @@ def _posterior_loss(model, guide, observation_labels, target_labels, analytic_en
         # num_particles = num_samples
         expanded_design = lexpand(design, num_particles) # ???
 
-        # Sample from p(y, theta | d)
+        # Sample from p(y, theta | d) the model
         trace = poutine.trace(model).get_trace(expanded_design) # trace: graph data structure denoting relationships amongst different pyro primitives
         y_dict = {l: trace.nodes[l]["value"] for l in observation_labels} # trace.nodes contains a collection (OrderedDict) of site names and metadata
         theta_dict = {l: trace.nodes[l]["value"] for l in target_labels}
@@ -68,7 +67,7 @@ def _posterior_loss(model, guide, observation_labels, target_labels, analytic_en
                 whitelist=target_labels).sum(0) / num_particles
             agg_loss = loss.sum()
         else:
-            terms = -sum(cond_trace.nodes[l]["log_prob"] for l in target_labels)
+            terms = -sum(cond_trace.nodes[l]["log_prob"] for l in target_labels) # forward pass through network and evaluate loss func
             agg_loss, loss = _safe_mean_terms(terms)
 
         return agg_loss, loss
@@ -239,6 +238,95 @@ def _eig_from_ape(model, design, target_labels, ape, eig, prior_entropy_kwargs):
         return prior_entropy - ape
     else:
         return ape
+
+
+def nmc_eig(
+    model,
+    design,
+    observation_labels,
+    target_labels=None,
+    N=100,
+    M=10,
+    M_prime=None,
+    independent_priors=False,
+    contrastive=False
+):
+    """
+    Based on Pyro implementation from:
+
+    https://github.com/pyro-ppl/pyro/blob/dev/pyro/contrib/oed/eig.py
+
+    adding an option for contrastive sampling to convert to a lower bound
+
+    """
+
+    if isinstance(observation_labels, str):  # list of strings instead of strings
+        observation_labels = [observation_labels]
+    if isinstance(target_labels, str):
+        target_labels = [target_labels]
+
+    # Take N samples of the model
+    expanded_design = lexpand(design, N)  # N copies of the model
+    trace = poutine.trace(model).get_trace(expanded_design) # sample y_n and theta_n N times
+    trace.compute_log_prob() # compute likelihood p(y_n | theta_n,0, d)
+
+    if M_prime is not None:
+        y_dict = {
+            l: lexpand(trace.nodes[l]["value"], M_prime) for l in observation_labels
+        }
+        theta_dict = {
+            l: lexpand(trace.nodes[l]["value"], M_prime) for l in target_labels
+        }
+        theta_dict.update(y_dict)
+        # Resample M values of u and compute conditional probabilities
+        # WARNING: currently the use of condition does not actually sample
+        # the conditional distribution!
+        # We need to use some importance weighting
+        conditional_model = pyro.condition(model, data=theta_dict)
+        if independent_priors:
+            reexpanded_design = lexpand(design, M_prime, 1)
+        else:
+            # Not acceptable to use (M_prime, 1) here - other variables may occur after
+            # theta, so need to be sampled conditional upon it
+            reexpanded_design = lexpand(design, M_prime, N)
+        retrace = poutine.trace(conditional_model).get_trace(reexpanded_design)
+        retrace.compute_log_prob()
+        conditional_lp = sum(
+            retrace.nodes[l]["log_prob"] for l in observation_labels
+        ).logsumexp(0) - math.log(M_prime)
+    else:
+        # This assumes that y are independent conditional on theta
+        # Furthermore assume that there are no other variables besides theta
+
+        # sum together likelihood terms for p(y_n|theta_n,0, d)
+        conditional_lp = sum(trace.nodes[l]["log_prob"] for l in observation_labels)
+
+    # calculate y_n from the model:
+    y_dict = {l: lexpand(trace.nodes[l]["value"], M) for l in observation_labels}
+    # Resample M values of theta and compute conditional probabilities
+    conditional_model = pyro.condition(model, data=y_dict)
+    # Using (M, 1) instead of (M, N) - acceptable to re-use thetas between ys because
+    # theta comes before y in graphical model
+    reexpanded_design = lexpand(design, M, 1) 
+    retrace = poutine.trace(conditional_model).get_trace(reexpanded_design) # sample theta_n,m M times conditioned on y_n
+    retrace.compute_log_prob() # compute likelihood p(y_n|theta_n,m, d)
+    if not contrastive:
+        # sum together likelihood terms for p(y_n|theta_n,m, d) with extra term from 1/M
+        marginal_lp = sum(
+            retrace.nodes[l]["log_prob"] for l in observation_labels
+        ).logsumexp(0) - math.log(M)
+
+        terms = conditional_lp - marginal_lp
+        nonnan = (~torch.isnan(terms)).sum(0).type_as(terms)
+        terms[torch.isnan(terms)] = 0.0
+        return terms.sum(0) / nonnan
+    else:
+        marginal_log_probs = torch.cat([lexpand(conditional_lp, 1),
+                                        sum(retrace.nodes[l]["log_prob"] for l in observation_labels)])
+        marginal_lp_lower = marginal_log_probs.logsumexp(0) - math.log(M+1)
+        marginal_lp_upper = marginal_log_probs[1:].logsumexp(0) - math.log(M)
+        return _safe_mean_terms(conditional_lp - marginal_lp_lower)[1], _safe_mean_terms(conditional_lp - marginal_lp_upper)[1]
+
 
 def monte_carlo_entropy(model, design, target_labels, num_prior_samples=1000):
     if isinstance(target_labels, str):
