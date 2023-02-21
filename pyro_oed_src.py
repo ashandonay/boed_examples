@@ -111,8 +111,7 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
         reexpanded_design = lexpand(expanded_design, M)
         conditional_guide = pyro.condition(guide, data=y_dict)
         guide_trace = poutine.trace(conditional_guide).get_trace(
-            y_dict, reexpanded_design, observation_labels, target_labels
-        )
+            y_dict, reexpanded_design, observation_labels, target_labels)
         theta_y_dict = {l: guide_trace.nodes[l]["value"] for l in target_labels}
         theta_y_dict.update(y_dict)
         guide_trace.compute_log_prob()
@@ -129,24 +128,32 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
 
         # to calculate lower and upper bounds:
         if contrastive:
-            lower_terms = -terms.logsumexp(0) + math.log(M) # returns log summed exponentials log(exp(x_1)+exp(x_2)..) of each row of the input tensor in the given dim (0)
+            # including the original sample theta_0 from which y was sampled to get the lower bound:
+            lower_terms = -terms.logsumexp(0) + math.log(M) 
+            # returns log summed exponentials log(exp(x_1)+exp(x_2)..) of each row of the input tensor in the given dim (0)
+            # excluding the original sample to get the upper bound:
             upper_terms = -terms[1:].logsumexp(0) + math.log(M-1)
+        else:
+            terms = -terms.logsumexp(0) + math.log(M)
+
+        if evaluation:
+            trace.compute_log_prob() # compute likelihood p(y_n | theta_n,0, d)
+            conditional_lp = sum(trace.nodes[l]["log_prob"] for l in observation_labels) # p(y_n | theta_n, d)
+            
+        if contrastive:
             if evaluation:
-                trace.compute_log_prob()
-                lower_terms += sum(trace.nodes[l]["log_prob"] for l in observation_labels)
-                upper_terms += sum(trace.nodes[l]["log_prob"] for l in observation_labels)
+                lower_terms += conditional_lp
+                upper_terms += conditional_lp
             lower_agg_loss, lower_loss = _safe_mean_terms(lower_terms)
             upper_agg_loss, upper_loss = _safe_mean_terms(upper_terms)
             agg_loss = (lower_agg_loss, upper_agg_loss)
             loss = (lower_loss, upper_loss)
-            return agg_loss, loss
         else:
-            terms = -terms.logsumexp(0) + math.log(M)
             if evaluation:
-                # At eval time, add p(y | theta, d) terms
-                trace.compute_log_prob()
-                terms += sum(trace.nodes[l]["log_prob"] for l in observation_labels)
-            return _safe_mean_terms(terms)
+                terms += conditional_lp
+            agg_loss, loss = _safe_mean_terms(terms)
+
+        return agg_loss, loss
     
     return loss_fn
 
@@ -348,3 +355,16 @@ def _safe_mean_terms(terms):
     loss = terms.sum(0) / nonnan
     agg_loss = loss.sum()
     return agg_loss, loss
+
+def _create_condition_input(design, y_dict, observation_labels, condition_design=True):
+    ys = [design]
+    for l in observation_labels:
+        if y_dict[l].ndim == design.ndim:
+            ys.append(y_dict[l])
+        else:
+            ys.append(y_dict[l].unsqueeze(dim=-1))
+
+    if condition_design:
+        return torch.cat(ys, dim=-1)
+    else:
+        return torch.cat(ys[1:], dim=-1).float()
