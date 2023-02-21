@@ -116,6 +116,9 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
         theta_y_dict.update(y_dict)
         guide_trace.compute_log_prob()
 
+        if contrastive:
+            contrastive_samples = torch.cat([lexpand(trace.nodes[l]["value"], 1) for l in target_labels], dim=0)
+
         # Re-run that through the model to compute the joint
         modelp = pyro.condition(model, data=theta_y_dict)
         model_trace = poutine.trace(modelp).get_trace(reexpanded_design)
