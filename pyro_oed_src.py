@@ -21,7 +21,6 @@ def posterior_eig(model, design, observation_labels, target_labels, num_samples,
         target_labels = [target_labels] # change str to list of string
 
     if return_history:
-
         ape, history = _posterior_ape(model, design, observation_labels, target_labels, num_samples, num_steps, guide, optim,
                             return_history=return_history, final_design=final_design, final_num_samples=final_num_samples,
                             *args, **kwargs)
@@ -57,8 +56,8 @@ def _posterior_loss(model, guide, observation_labels, target_labels, analytic_en
         theta_dict = {l: trace.nodes[l]["value"] for l in target_labels}
 
         # Run through q(theta | y, d)
-        conditional_guide = pyro.condition(guide, data=theta_dict) # change the sample statements in dictionary into observations with those values
-        cond_trace = poutine.trace(conditional_guide).get_trace(
+        #conditional_guide = pyro.condition(guide, data=theta_dict)
+        cond_trace = poutine.trace(guide).get_trace(
             y_dict, expanded_design, observation_labels, target_labels) 
         cond_trace.compute_log_prob() # compute site-wise log probabilities of each trace. (shape = batch_shape)
         if evaluation and analytic_entropy:
@@ -114,14 +113,15 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
         # Sample M times from q(theta | y, d) for each y
         reexpanded_design = lexpand(expanded_design, M)
         conditional_guide = pyro.condition(guide, data=y_dict) # condition the guide on y_n
+        # sample theta_n,m M times for each y_n
         guide_trace = poutine.trace(conditional_guide).get_trace(
             y_dict, reexpanded_design, observation_labels, target_labels)
-        # sample theta_n,m M times for each y_n
         theta_y_dict = {l: guide_trace.nodes[l]["value"] for l in target_labels}
         # theta_n,m has shape [M,N,n_designs]
         guide_trace.compute_log_prob() # compute q(theta_n,m | y_n, d, phi), site-wise log probabilities of each trace. (shape = batch_shape)
 
         if contrastive:
+            # concatenate original sample theta_0 to be included in the inner sum
             theta_y_dict = {l: torch.cat(
             [lexpand(trace.nodes[l]["value"], 1, N, 1), theta_y_dict[l]], dim=0) for l in target_labels}
             M += 1
@@ -136,7 +136,7 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
         modelp = pyro.condition(model, data=theta_y_dict) # condition the model on theta_n,m
         model_trace = poutine.trace(modelp).get_trace(reexpanded_design)
         # sample y_n M times for each theta_n,m
-        model_trace.compute_log_prob() # compute p(y_n | theta_n,m, d)
+        model_trace.compute_log_prob() # compute joint likelihood p(y_n, theta_n,m, | d)
 
         terms = -sum(guide_trace.nodes[l]["log_prob"] for l in target_labels) # q(theta_nm | y_n)
         terms += sum(model_trace.nodes[l]["log_prob"] for l in target_labels) # p(theta_nm)
@@ -228,6 +228,7 @@ def opt_eig_ape_loss(design, loss_fn, num_samples, num_steps, optim, return_hist
                 if torch.isnan(agg_loss):
                     raise ArithmeticError("Encountered NaN loss in opt_eig_ape_loss")
                 agg_loss.backward(retain_graph=True)
+                print("step: ", step, "loss: ", loss)
                 if return_history:
                     history.append(loss)
                 optim(params)
