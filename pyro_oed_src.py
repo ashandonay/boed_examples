@@ -100,14 +100,12 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
 
     def loss_fn(design, num_particles, evaluation=False, **kwargs):
         N, M = num_particles
-        n_designs = design.shape[0]
         expanded_design = lexpand(design, N) # N copies of the model
 
         # Sample from p(y, theta | d)
         trace = poutine.trace(model).get_trace(expanded_design) 
         # sample y_n and theta_n N times
-            # POSSIBLE BUG: only one theta is sampled ?
-            # theta (w, phase) has only one value per parameter because it is fixed for a given model
+            # POSSIBLE BUG: only one theta is sampled ? FIXED
         y_dict = {l: lexpand(trace.nodes[l]["value"], M) for l in observation_labels}
 
         # Sample M times from q(theta | y, d) for each y
@@ -117,47 +115,43 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
         guide_trace = poutine.trace(conditional_guide).get_trace(
             y_dict, reexpanded_design, observation_labels, target_labels)
         theta_y_dict = {l: guide_trace.nodes[l]["value"] for l in target_labels}
+        theta_y_dict.update(y_dict) # theta_y_dict contains theta_n,m and y_n
         # theta_n,m has shape [M,N,n_designs]
         guide_trace.compute_log_prob() # compute q(theta_n,m | y_n, d, phi), site-wise log probabilities of each trace. (shape = batch_shape)
 
         if contrastive:
             # concatenate original sample theta_0 to be included in the inner sum
-            theta_y_dict = {l: torch.cat(
-            [lexpand(trace.nodes[l]["value"], 1, N, 1), theta_y_dict[l]], dim=0) for l in target_labels}
-            M += 1
+            theta_y_dict = {l: torch.cat([lexpand(trace.nodes[l]["value"], 1), theta_y_dict[l]], dim=0) for l in target_labels}
             y_dict = {l: torch.cat([lexpand(trace.nodes[l]["value"], 1), y_dict[l]], dim=0) for l in observation_labels}
+            M += 1
             reexpanded_design = lexpand(expanded_design, M)
             conditional_guide = pyro.condition(guide, data=y_dict) # condition the guide on y_n
             guide_trace = poutine.trace(conditional_guide).get_trace(
                 y_dict, reexpanded_design, observation_labels, target_labels)
+            theta_y_dict = {l: guide_trace.nodes[l]["value"] for l in target_labels}
+            theta_y_dict.update(y_dict)
             guide_trace.compute_log_prob()
 
-        # Re-run that through the model to compute the joint
-        modelp = pyro.condition(model, data=theta_y_dict) # condition the model on theta_n,m
+        # Re-run that through the model to compute the joint for a given theta_n and y_n
+        modelp = pyro.condition(model, data=theta_y_dict)
+        # sample y_n and theta_n,m M times
         model_trace = poutine.trace(modelp).get_trace(reexpanded_design)
-        # sample y_n M times for each theta_n,m
         model_trace.compute_log_prob() # compute joint likelihood p(y_n, theta_n,m, | d)
 
         terms = -sum(guide_trace.nodes[l]["log_prob"] for l in target_labels) # q(theta_nm | y_n)
         terms += sum(model_trace.nodes[l]["log_prob"] for l in target_labels) # p(theta_nm)
-        terms = terms.squeeze()
         terms += sum(model_trace.nodes[l]["log_prob"] for l in observation_labels) # p(y_n | theta_nm, d)
+
+        if evaluation:
+            trace.compute_log_prob() # compute likelihood p(y_n | theta_n,0, d)
+            conditional_lp = sum(trace.nodes[l]["log_prob"] for l in observation_labels) # p(y_n | theta_n, d)
 
         # to calculate lower and upper bounds:
         if contrastive:
             # including the original sample of theta_0 from which y was sampled to get the lower bound:
             lower_terms = -terms.logsumexp(0) + math.log(M) 
-            # returns log summed exponentials log(exp(x_1)+exp(x_2)..) of each row of the input tensor in the given dim (0)
             # excluding the original sample to get the upper bound:
             upper_terms = -terms[1:].logsumexp(0) + math.log(M-1)
-        else:
-            terms = -terms.logsumexp(0) + math.log(M)
-
-        if evaluation:
-            trace.compute_log_prob() # compute likelihood p(y_n | theta_n,0, d)
-            conditional_lp = sum(trace.nodes[l]["log_prob"] for l in observation_labels) # p(y_n | theta_n, d)
-            
-        if contrastive:
             if evaluation:
                 lower_terms += conditional_lp
                 upper_terms += conditional_lp
@@ -166,6 +160,8 @@ def _vnmc_eig_loss(model, guide, observation_labels, target_labels, contrastive=
             agg_loss = (lower_agg_loss, upper_agg_loss)
             loss = (lower_loss, upper_loss)
         else:
+            # returns log summed exponentials log(exp(x_1)+exp(x_2)..) of each row of the input tensor in the given dim (0)
+            terms = -terms.logsumexp(0) + math.log(M) 
             if evaluation:
                 terms += conditional_lp
             agg_loss, loss = _safe_mean_terms(terms)
@@ -209,7 +205,8 @@ def opt_eig_ape_loss(design, loss_fn, num_samples, num_steps, optim, return_hist
 
             _, loss = loss_fn(final_design, final_num_samples, evaluation=True, contrastive=True)
             if return_history:
-                return loss, torch.stack(history_lower), torch.stack(history_upper)
+                history = torch.stack(history_lower), torch.stack(history_upper)
+                return loss, history
             else:
                 return loss
 
