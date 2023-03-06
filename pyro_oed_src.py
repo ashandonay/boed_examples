@@ -48,7 +48,7 @@ def _posterior_loss(model, guide, observation_labels, target_labels, analytic_en
     def loss_fn(design, num_particles, evaluation=False, **kwargs):
 
         # num_particles = num_samples
-        expanded_design = lexpand(design, num_particles) # ???
+        expanded_design = lexpand(design, num_particles) # expand num_particles copies to left dimension
 
         # Sample from p(y, theta | d) the model
         trace = poutine.trace(model).get_trace(expanded_design) # trace: graph data structure denoting relationships amongst different pyro primitives
@@ -56,8 +56,8 @@ def _posterior_loss(model, guide, observation_labels, target_labels, analytic_en
         theta_dict = {l: trace.nodes[l]["value"] for l in target_labels}
 
         # Run through q(theta | y, d)
-        #conditional_guide = pyro.condition(guide, data=theta_dict)
-        cond_trace = poutine.trace(guide).get_trace(
+        conditional_guide = pyro.condition(guide, data=theta_dict) # set the sample statements in the guide to the values in theta_dict
+        cond_trace = poutine.trace(conditional_guide).get_trace(
             y_dict, expanded_design, observation_labels, target_labels) 
         cond_trace.compute_log_prob() # compute site-wise log probabilities of each trace. (shape = batch_shape)
         if evaluation and analytic_entropy:
